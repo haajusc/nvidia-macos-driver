@@ -26,6 +26,35 @@ mount_efi() {   # $1 = device or partition UUID; sets MOUNT_POINT in this shell
   local mp; mp=$(mnt "$1")
   if [ -z "$mp" ]; then diskutil mount "$1" >/dev/null 2>&1 || return 1; MOUNTED="$MOUNTED $1"; mp=$(mnt "$1"); fi
   MOUNT_POINT=$mp; [ -n "$MOUNT_POINT" ]; }
+# Legacy FAT32 1401 sticks may have no Partition UUID. Their recorded /Volumes path
+# can disappear between boots because removable volumes are not always mounted.
+# Only rediscover the original volume when both its label and its unique install
+# backup match. Never select an arbitrary EFI or a same-model OpenCore config.
+remount_recorded_fat32() {
+  local base name d label mp match="" count=0
+  [ -n "${CONFIG_PATH:-}" ] && [ -n "${OCREL:-}" ] && [ -n "${CONFIG_BACKUP_REL:-}" ] || return 1
+  case "$OCREL" in EFI/OC|EFI/BOOT) ;; *) return 1;; esac
+  case "$CONFIG_PATH" in
+    */"$OCREL"/config.plist) base=${CONFIG_PATH%/"$OCREL"/config.plist};;
+    *) return 1;;
+  esac
+  case "$base" in /Volumes/*) ;; *) return 1;; esac
+  name=${base#/Volumes/}
+  case "$name" in ""|*/*) return 1;; esac
+  case "$CONFIG_BACKUP_REL" in "$OCREL"/config.plist.nullmoth-*) ;; *) return 1;; esac
+  for d in $(diskutil list | awk '/ EFI | DOS_FAT_32 | Windows_FAT_32 | Microsoft Basic Data /{print $NF}' | grep -E '^disk[0-9]+s[0-9]+$'); do
+    label=$(diskutil info "$d" 2>/dev/null | awk -F': *' '/^[[:space:]]*Volume Name:/{print $2; exit}')
+    [ "$label" = "$name" ] || continue
+    mount_efi "$d" || continue
+    mp=$MOUNT_POINT
+    [ -f "$mp/$OCREL/config.plist" ] && [ -f "$mp/$CONFIG_BACKUP_REL" ] &&
+      plutil -lint "$mp/$OCREL/config.plist" >/dev/null 2>&1 || continue
+    match=$mp; count=$((count+1))
+  done
+  [ "$count" -eq 1 ] || return 1
+  MP=$match; C="$MP/$OCREL/config.plist"
+  note "remounted the uniquely matched 1401 OpenCore volume '$name' and its install backup"
+}
 owned_amfi_from_prior_record() (
   # Inherit only explicitly recorded shared-token ownership from the unchanged
   # configuration on the same identified partition. Legacy or changed records
@@ -216,8 +245,12 @@ if [ $REMOVE = 1 ]; then
     mount_efi "$EFI_UUID" || stop "could not mount the recorded OpenCore partition; attach the original boot disk or select its replacement - nothing changed"; MP=$MOUNT_POINT
     C="$MP/${OCREL:-EFI/OC}/config.plist"
   elif [ -n "${CONFIG_PATH:-}" ]; then
-    C=$CONFIG_PATH; [ -f "$C" ] || stop "the recorded config is missing - nothing changed"
-    MP=$(cd "$(dirname "$C")/../.." && pwd) || stop "cannot resolve the recorded OpenCore partition"
+    C=$CONFIG_PATH
+    if [ -f "$C" ]; then
+      MP=$(cd "$(dirname "$C")/../.." && pwd) || stop "cannot resolve the recorded OpenCore partition"
+    else
+      remount_recorded_fat32 || stop "the recorded config is not mounted and no unique matching volume with its install backup was found - nothing changed"
+    fi
   fi
   [ -n "$C" ] || stop "the install record has no OpenCore partition; select the original config - nothing changed"
   if [ -n "$C" ]; then
